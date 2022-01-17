@@ -28,6 +28,8 @@ const resourceBaseName = "hostappconfig"
 
 const keyVaultResourceName = "appconfigkv"
 
+const replacementForSecret = "mysecret"
+
 var secrets = make(map[string]map[string]string)
 
 func main() {
@@ -89,7 +91,7 @@ func exportSettings(env string, host string, fileName string) {
 
 	regStr := `\{\s*\"uri\"\:\s*\"\S*\"\s*\}`
 	r := regexp.MustCompile(regStr)
-	scontent = r.ReplaceAllString(scontent, `"secret"`)
+	scontent = r.ReplaceAllString(scontent, `"`+replacementForSecret+`"`)
 
 	//Write to file
 	fmt.Println("Write to file")
