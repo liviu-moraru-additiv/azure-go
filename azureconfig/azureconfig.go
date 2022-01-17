@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -12,226 +13,148 @@ import (
 	"strings"
 )
 
+type KVInfo struct {
+	Id   string
+	Name string
+}
+
 type Elem struct {
 	Key   string
 	Label string
 	Value string
 }
 
-type duplicateKey struct {
-	Label string `json:"label"`
-	Key   string `json:"key"`
-}
+const resourceBaseName = "hostappconfig"
 
-const inheritedKey = "inherited"
-const templabel = "temp"
+const keyVaultResourceName = "appconfigkv"
+
+var secrets = make(map[string]map[string]string)
 
 func main() {
 
-	azureResourceName := flag.String("resource", "", "The Azure App Configuration Resource Name")
-	label := flag.String("label", "", "Label ex: ClientServices")
+	env := flag.String("env", "", "The environment. ( ex. ci, ctp etc.")
+	appkey := flag.String("appkey", "", "The AppKey ( ex. clientservices, reportingservices etc.")
+
 	fileName := flag.String("file", "", "Import file")
 	command := flag.String("command", "", "Command (d-delete, a-setAppsettingsKey, i-importSettings, e-exportSettings)")
 
 	flag.Parse()
 
-	if *azureResourceName == "" {
-		log.Fatalf("Provide the Azure resource name: ex hostappconfig-ctp.")
+	if *env == "" {
+		log.Fatalf("Provide the environment. ( ex. ci, ctp etc.")
 	}
 
-	/*if *label == "" {
-		log.Fatalf("Provide label: ex ClientServices.")
-	}*/
+	if *appkey == "" {
+		log.Fatalf("Provide the AppKey ( ex. clientservices, reportingservices etc.")
+	}
+
 	if *command == "" || (*command != "d" && *command != "e" && *command != "i") {
 		log.Fatalf("Command must be -d (delete) or -e (setAppsettingsKey)")
 	}
 
 	switch *command {
 	case "d":
-		deleteFromLabel(*azureResourceName, *label)
+		deleteFromLabel(*env, *appkey)
 	case "a":
-		setAppsettingsKey(*azureResourceName, *label)
+		setAppsettingsKey(*env, *appkey)
 	case "i":
-		importSettings(*azureResourceName, *label, *fileName)
+		importSettings(*env, *appkey, *fileName)
 	case "e":
-		exportSettings(*azureResourceName, *label, *fileName)
+		exportSettings(*env, *appkey, *fileName)
 	}
 
 }
 
-func exportSettings(azureResourceName string, label string, fileName string) {
-
-	defer deleteFromLabel(azureResourceName, templabel)
-
-	//Clenup temp label
-	deleteFromLabel(azureResourceName, templabel)
-	//Copy the current label to tmpLabel
-	copyToTempLabel(azureResourceName, label, templabel)
-
-	//Retrieve the inherited key
-	inhKeys, err := retrieveInheritedKey(azureResourceName, label)
-
-	//Copy the inherited keys to temp label
-	if err != nil {
-		fmt.Printf("Cannot retrieve the %s key", inheritedKey)
-	} else {
-		copyInhKeysToTempLabel(azureResourceName, inhKeys)
-	}
+func exportSettings(env string, host string, fileName string) {
+	azureResourceName := resourceBaseName + "-" + env
 
 	//Export to file
-	cmdLine := "az appconfig kv export -n " + azureResourceName + " --label " + templabel + " -d file --path " + fileName + " --format json --yes --separator :"
-	fmt.Printf("Command line: %s\n", cmdLine)
+	fmt.Println("Export to file")
+	cmdLine := "az appconfig kv export -n " + azureResourceName + " --label " + host + " -d file --path " + fileName + " --format json --yes --separator :"
 	cmd := getCommand(cmdLine)
-	err = cmd.Run()
+	err := cmd.Run()
 	if err != nil {
 		log.Fatalf("Error running export to file: %v", err)
 	}
 
-}
-
-func copyInhKeysToTempLabel(azureResourceName string, inhKeys []*duplicateKey) {
-	for _, inh := range inhKeys {
-		l := inh.Label
-		if l == "root" {
-			l = "\\0"
-		}
-
-		cmdLine := "az appconfig kv export --yes --name " + azureResourceName + " -d appconfig --key " + inh.Key + " --label " + l + " --dest-name " + azureResourceName + " --dest-label " + templabel
-		fmt.Printf("Command line: %s\n", cmdLine)
-		cmd := getCommand(cmdLine)
-		err := cmd.Run()
-		if err != nil {
-			log.Fatalf("Cannot set the %s key on label %s. Error: %s", inh.Key, templabel, err)
-		}
-
+	// Read file
+	content, err := ioutil.ReadFile(fileName)
+	if err != nil {
+		log.Fatalf("Cannot retrieve file content after export")
 	}
+	scontent := string(content)
+
+	// Replace secrets
+	fmt.Println("Replace secrets")
+
+	regStr := `\{\s*\"uri\"\:\s*\"\S*\"\s*\}`
+	r := regexp.MustCompile(regStr)
+	scontent = r.ReplaceAllString(scontent, `"secret"`)
+
+	//Write to file
+	fmt.Println("Write to file")
+	os.WriteFile(fileName, []byte(scontent), 0644)
 
 }
 
-func getKeyValue(azureResourceName string, label string, key string) (string, error) {
-	cmdLine := "az appconfig kv list --name " + azureResourceName + " --fields value --key " + key + "  --label " + label
+func importSecretKeys() {
+	var kv []KVInfo
+	cmdLine := "az keyvault secret list --vault-name " + keyVaultResourceName
 	cmd := getCommand(cmdLine)
 	out, err := cmd.Output()
-
 	if err != nil {
-		return "", fmt.Errorf("error running command %s", cmdLine)
+		log.Fatalf("Cannot retrieve key vault keys")
+	}
+	json.Unmarshal(out, &kv)
+	for _, k := range kv {
+		sv := strings.Split(k.Name, "-")
+		if len(sv) >= 3 {
+			appKey := sv[0] + "-" + sv[1]
+			kvId := strings.Join(sv[2:], ":")
+			if v, ok := secrets[appKey]; ok {
+				v[kvId] = k.Id
+			} else {
+				newMap := make(map[string]string)
+				newMap[kvId] = k.Id
+				secrets[appKey] = newMap
+
+			}
+		}
 	}
 
-	vout := make([]map[string]interface{}, 0)
-	err = json.Unmarshal(out, &vout)
-	if err != nil || len(vout) == 0 {
-		return "", fmt.Errorf("cannot retrieve key %s from label %s", key, label)
-	}
-
-	return vout[0]["value"].(string), nil
 }
+func importSettings(env string, host string, fileName string) {
 
-func retrieveInheritedKey(azureResourceName string, label string) ([]*duplicateKey, error) {
-	var dp []*duplicateKey
-	out, err := getKeyValue(azureResourceName, label, inheritedKey)
-	if err != nil {
-		return nil, fmt.Errorf("cannot retrieve %s key", inheritedKey)
+	importSecretKeys()
+	azureResourceName := resourceBaseName + "-" + env
+
+	if fileName == "" {
+		log.Fatalf("Provide the name of the file to be imported.")
 	}
-
-	err = json.Unmarshal([]byte(out), &dp)
+	_, err := os.Stat(fileName)
 	if err != nil {
-		return nil, fmt.Errorf("cannot retrieve %s key", inheritedKey)
+		log.Fatalf("Cannot open file %s", fileName)
 	}
-
-	return dp, nil
-}
-
-func copyToTempLabel(azureResourceName string, label string, tmpLabel string) {
-	//To do exclude key appsettings and inherited
-	cmdLine := "az appconfig kv export --yes --name " + azureResourceName + " -d appconfig --key *  --label " + label + " --dest-name " + azureResourceName + " --dest-label " + tmpLabel
-	fmt.Printf("Command: %s\n", cmdLine)
-	cmd := getCommand(cmdLine)
-	err := cmd.Run()
-	if err != nil {
-		log.Fatalf("Error running command %s. Error: %s", cmdLine, err)
-	}
-
-	cmdLine = "az appconfig kv delete --yes --name " + azureResourceName + " --key appsettings  --label " + tmpLabel
-	fmt.Printf("Command: %s\n", cmdLine)
-	cmd = getCommand(cmdLine)
-	cmd.Run()
-
-	cmdLine = "az appconfig kv delete --yes --name " + azureResourceName + " --key inherited  --label " + tmpLabel
-	fmt.Printf("Command: %s\n", cmdLine)
-	cmd = getCommand(cmdLine)
-	cmd.Run()
-}
-
-func importSettings(azureResourceName string, label string, fileName string) {
 
 	//Cleanup current label
-	deleteFromLabel(azureResourceName, label)
-
-	var rootMap map[string]string
-	var secondLevelMap map[string]string
-	var currentMap map[string]string
+	deleteFromLabel(env, host)
 
 	//Import from json file into current label
-	currentMap = importLabel(azureResourceName, label, fileName)
 
-	//Retrieve the keys from root label
-	rootMap = listKeysValues(azureResourceName, "")
-
-	//If current label is a host label, retrieve the keys for environment label
-	splitLabel := strings.Split(label, "-")
-	var envLabel string
-	if len(splitLabel) == 2 {
-		envLabel = splitLabel[0]
-		secondLevelMap = listKeysValues(azureResourceName, envLabel)
-	}
-
-	fmt.Printf("Root level no of keys: %d\n", len(rootMap))
-	fmt.Printf("Seconf level no of keys: %d\n", len(secondLevelMap))
-	fmt.Printf("Current level no of keys:%d\n", len(currentMap))
-
-	//Set appsettings key with the structure of the source json file
-	setAppsettingsKey(azureResourceName, label)
-
-	//Take the duplicate keys from the upper levels and delete them from current label
-	dupk := processDuplicateKeys(azureResourceName, label, currentMap, rootMap, secondLevelMap, envLabel)
-
-	// Set the inherited key with the list of inherited keys and the source of them
-	setInheritedKey(azureResourceName, label, dupk)
-}
-
-func setInheritedKey(azureResourceName string, label string, dupk []*duplicateKey) {
-	b, err := json.Marshal(dupk)
-
-	if err != nil {
-		log.Fatalf("Error saving key %s:  %+v", inheritedKey, err)
-
-	}
-	cmdLine := "az appconfig kv set --name " + azureResourceName + " --key " + inheritedKey + " --label " + label + " --content-type application/json --yes --value " + string(b)
-	cmd := getCommand(cmdLine)
-	err = cmd.Run()
-	if err != nil {
-		log.Fatalf("Cannot set the %s key. Error: %s", inheritedKey, err)
-	}
-}
-
-func processDuplicateKeys(azureResourceName string, label string, currentMap map[string]string, rootMap map[string]string, secondLevelMap map[string]string, envLabel string) []*duplicateKey {
-	var dupk []*duplicateKey
-	for key, value := range currentMap {
-		fv, fok := rootMap[key]
-		sv, sok := secondLevelMap[key]
-		if (fok && fv == value) || (sok && sv == value) {
-			if fok {
-				dupk = append(dupk, &duplicateKey{Label: "root", Key: key})
-			} else {
-				dupk = append(dupk, &duplicateKey{Label: envLabel, Key: key})
+	importedMap := importLabel(azureResourceName, host, fileName)
+	if s, ok := secrets[env+"-"+host]; ok {
+		for k, v := range s {
+			if _, ok := importedMap[k]; ok {
+				cmdLine := "az appconfig kv set-keyvault --yes -n " + azureResourceName + " --key " + k + " --label " + host + " --secret-identifier " + v
+				cmd := getCommand(cmdLine)
+				err = cmd.Run()
+				if err != nil {
+					log.Fatalf("Cannot set the secret %s for key %s.", v, k)
+				}
 			}
-			workerForDeleteKey(azureResourceName, label, key)
-
 		}
-
 	}
 
-	return dupk
 }
 
 func importLabel(azureResourceName string, label string, fileName string) map[string]string {
@@ -273,35 +196,14 @@ func transf(elems []Elem) map[string]string {
 	return values
 }
 
-/*func deleteFromLabel(azureResourceName string, label string) {
-
-	var elems []Elem
-	cmdLine := "az appconfig kv list --name " + azureResourceName + " --label "
-	if label == "" {
-		cmdLine += "\\0"
-	} else {
-		cmdLine += label
-	}
-	cmd := getCommand(cmdLine)
-	out, err := cmd.Output()
-	if err != nil {
-		log.Fatalf("Command finished with error: %v", err)
-	}
-
-	json.Unmarshal(out, &elems)
-
-	for _, elem := range elems {
-		workerForDeleteKey(azureResourceName, label, elem.Key)
-	}
-}*/
-func deleteFromLabel(azureResourceName string, label string) {
+func deleteFromLabel(env string, host string) {
+	azureResourceName := resourceBaseName + "-" + env
 	cmdLine := "az appconfig kv delete --name " + azureResourceName + " --yes --key * --label "
-	if label == "" {
+	if host == "" {
 		cmdLine += "\\0"
 	} else {
-		cmdLine += label
+		cmdLine += host
 	}
-	fmt.Printf("Command line: %s\n", cmdLine)
 	cmd := getCommand(cmdLine)
 
 	err := cmd.Run()
@@ -309,29 +211,13 @@ func deleteFromLabel(azureResourceName string, label string) {
 		fmt.Printf("Error: %s\n", err)
 	}
 }
-func workerForDeleteKey(azureResourceName string, label string, key string) {
 
-	cmdLine := "az appconfig kv delete --name " + azureResourceName + " --yes --key " + key + " --label "
-	if label == "" {
-		cmdLine += "\\0"
-	} else {
-		cmdLine += label
-	}
-	fmt.Printf("Command line: %s\n", cmdLine)
-	cmd := getCommand(cmdLine)
-
-	err := cmd.Run()
-	if err != nil {
-		fmt.Printf("Error: %s\n", err)
-	}
-
-}
-
-func setAppsettingsKey(azureResourceName string, label string) {
+func setAppsettingsKey(env string, host string) {
+	azureResourceName := resourceBaseName + "-" + env
 	tempFile := "temp.json"
 	cmdLine := "az appconfig kv export --name " + azureResourceName + "    --destination file --path " + tempFile + " --format json --separator : --yes"
-	if label != "" {
-		cmdLine += " --label " + label
+	if host != "" {
+		cmdLine += " --label " + host
 	}
 
 	cmd := getCommand(cmdLine)
@@ -351,7 +237,7 @@ func setAppsettingsKey(azureResourceName string, label string) {
 	text = strconv.Quote(text)
 	text = strings.ReplaceAll(text, " ", "")
 
-	cmdLine = "az appconfig kv set --name " + azureResourceName + " --key appsettings --label " + label + " --content-type application/json --yes --value " + text
+	cmdLine = "az appconfig kv set --name " + azureResourceName + " --key appsettings --label " + host + " --content-type application/json --yes --value " + text
 	cmd = getCommand(cmdLine)
 	err = cmd.Run()
 	if err != nil {
@@ -360,7 +246,19 @@ func setAppsettingsKey(azureResourceName string, label string) {
 
 }
 
+func copyToTempLabel(azureResourceName string, host string, tmpLabel string) {
+
+	cmdLine := "az appconfig kv export --yes --name " + azureResourceName + " -d appconfig --key *  --label " + host + " --dest-name " + azureResourceName + " --dest-label " + tmpLabel
+	cmd := getCommand(cmdLine)
+	err := cmd.Run()
+	if err != nil {
+		log.Fatalf("Error running command %s. Error: %s", cmdLine, err)
+	}
+
+}
+
 func getCommand(cmd string) *exec.Cmd {
+	fmt.Printf("Command line: %s\n", cmd)
 	space := regexp.MustCompile(`\s+`)
 	cmd = space.ReplaceAllString(cmd, " ")
 	args := strings.Split(cmd, " ")
