@@ -20,9 +20,10 @@ steps:
     ArtifactName: 'drop'
 - task: GoTool@0
   inputs:
-    version: '1.15'
+    version: '1.17'
 
 - task: Go@0
   inputs:
     command: 'build'
-    workingDirectory: '$(Build.ArtifactStagingDirectory)/azureconfig'
+    workingDirectory: '$(Build.ArtifactStagingDirectory)'
+    arguments: './...'
